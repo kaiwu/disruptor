@@ -30,6 +30,7 @@ template <size_t N, size_t X = 0> struct next_power_of_2 {
   constexpr static size_t value = power_of_2<X>::value > N ? power_of_2<X>::value : next_power_of_2<N, X + 1>::value;
 };
 
+// reasonable hack
 template <size_t N> struct next_power_of_2<N, 63> {
   constexpr static size_t value = power_of_2<63>::value;
 };
@@ -44,14 +45,14 @@ constexpr static size_t AUINT64_PADDING_SIZE = padding_size<std::atomic_uint_fas
 constexpr static size_t TIMEOUT_PADDING_SIZE = padding_size<struct timespec, CACHE_LINE_SIZE>::value;
 
 struct alignas(CACHE_LINE_SIZE) count_t {
-  std::atomic_uint_fast64_t count;
+  std::atomic_uint_fast64_t count{0};
   uint8_t padding[AUINT64_PADDING_SIZE];
 };
 static_assert(sizeof(count_t) == CACHE_LINE_SIZE, "");
 static_assert(alignof(count_t) == CACHE_LINE_SIZE, "");
 
 struct alignas(CACHE_LINE_SIZE) cursor_t {
-  std::atomic_uint_fast64_t sequence;
+  std::atomic_uint_fast64_t sequence{0};
   uint8_t padding[AUINT64_PADDING_SIZE];
 };
 static_assert(sizeof(cursor_t) == CACHE_LINE_SIZE, "");
@@ -70,17 +71,33 @@ template <size_t N, size_t R, typename T> struct ring_buffer {
   static_assert((N & (N - 1)) == 0, "N must be power of 2");
   constexpr static size_t SIZE_MASK = N - 1;
   constexpr static size_t ENTRY_PADDING_SIZE = padding_size<T, CACHE_LINE_SIZE>::value;
+  constexpr static size_t READER_PADDING_SIZE = padding_size<ring_buffer*, CACHE_LINE_SIZE>::value;
 
   struct alignas(CACHE_LINE_SIZE) entry {
     T value;
     uint8_t padding[ENTRY_PADDING_SIZE];
   };
 
+  // each reader thread writes its own begin and end
+  // readers check ring buffer's tail_cursor to catch up to it (including)
+  // in other words, tail_cursor is the last readable entry
+  struct alignas(CACHE_LINE_SIZE) reader {
+    cursor_t begin;
+    cursor_t end;
+    ring_buffer* rb;
+    uint8_t padding[READER_PADDING_SIZE];
+  };
+
   entry buffer[N];
-  cursor_t tail_cursor; // reader
-  cursor_t head_cursor; // writer
-  cursor_t readers[R];
-  cursor_t slowest_reader;
+  reader readers[R];    // writers check each reader's end, writers can only write when the last_reader catch up close enough
+  cursor_t tail_cursor; // writers contend to commit tail_cursor
+  cursor_t head_cursor; // writers contend to fetch head_cursor, (last_reader, head_cursor) must be in ring buffer's range
+  count_t num_readers;
+
+  // writers can only write when ring buffer is ready
+  bool ready() const noexcept {
+    return this->num_readers.count == R;
+  }
 
   ring_buffer() = delete;
   ring_buffer(const ring_buffer&) = delete;
@@ -103,8 +120,7 @@ template <size_t N, size_t R, typename T> struct ring_buffer {
     return &buffer[SIZE_MASK & sequence];
   };
 
-  const entry* get(const cursor_t* cursor) const noexcept {
-    auto sequence = cursor->sequence.load(std::memory_order_relaxed);
+  const entry* get(uint_fast64_t sequence) const noexcept {
     return &buffer[SIZE_MASK & sequence];
   };
 
