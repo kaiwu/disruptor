@@ -73,20 +73,24 @@ TEST_CASE("performance", "[disruptor]") {
   typedef size_t A;
   using disruptor = ring_buffer<1024 * 2, 1, A>;
   size_t total = 50 * 1000 * 1000 * 5;
+  size_t sum{0};
   struct timeval start;
   struct timeval end;
 
   auto rb = disruptor::create();
 
-  std::thread c1{[rb, &end, total]() {
+  std::thread c1{[rb, &end, total](size_t* s) {
     auto r = rb->create_reader();
     REQUIRE(r != nullptr);
     size_t n = 0;
     while (n < total) {
-      r->block_read([&n](const disruptor::entry* e) { n += 1; });
+      r->block_read([&n, s](const disruptor::entry* e) { 
+          *s += e->value;
+          n += 1; 
+      });
     }
     gettimeofday(&end, NULL);
-  }};
+  }, &sum};
 
   while (!rb->ready())
     ;
@@ -96,7 +100,7 @@ TEST_CASE("performance", "[disruptor]") {
     size_t n = 0;
     while (n < total) {
       rb->spin_write([&n](disruptor::entry* e) {
-        e->value = n;
+        e->value = 1;
         n += 1;
       });
     }
@@ -105,9 +109,12 @@ TEST_CASE("performance", "[disruptor]") {
   c1.join();
   p1.join();
 
+  REQUIRE(sum == total);
   double stime = (double)start.tv_sec + (double)start.tv_usec / 1000000.0;
   double etime = (double)end.tv_sec + (double)end.tv_usec / 1000000.0;
   double span = etime - stime;
   printf("span: %lf seconds\n", span);
   printf("per second: %lf\n", total / span);
+
+  free(rb);
 }
